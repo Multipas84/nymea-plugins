@@ -36,8 +36,11 @@
 #include <network/networkaccessmanager.h>
 #include <network/mqtt/mqttchannel.h>
 #include <network/mqtt/mqttprovider.h>
+#include <network/networkdevicemonitor.h>
 #include <integrations/integrationplugin.h>
 #include <plugintimer.h>
+
+#include "extern-plugininfo.h"
 
 class IntegrationPluginGoECharger: public IntegrationPlugin
 {
@@ -47,13 +50,26 @@ class IntegrationPluginGoECharger: public IntegrationPlugin
     Q_INTERFACES(IntegrationPlugin)
 
 public:
+    enum ApiVersion {
+        ApiVersion1 = 1,
+        ApiVersion2 = 2
+    };
+
     enum CarState {
+        CarStateUnknown = 0,
         CarStateReadyNoCar = 1,
         CarStateCharging = 2,
         CarStateWaitForCar = 3,
         CarStateChargedCarConnected = 4
     };
     Q_ENUM(CarState)
+
+    enum ForceState {
+        ForceStateNeutral = 0,
+        ForceStateOff = 1,
+        ForceStateOn = 2
+    };
+    Q_ENUM(ForceState)
 
     enum Access {
         AccessOpen = 0,
@@ -88,20 +104,37 @@ public:
 private:
     PluginTimer *m_refreshTimer = nullptr;
     QHash<Thing *, MqttChannel *> m_channels;
+    QHash<Thing *, NetworkDeviceMonitor *> m_monitors;
     QHash<Thing *, QNetworkReply *> m_pendingReplies;
 
     void update(Thing *thing, const QVariantMap &statusMap);
+
+    void setupGoeHome(ThingSetupInfo *info);
+
     QNetworkRequest buildStatusRequest(Thing *thing);
-    QNetworkRequest buildConfigurationRequest(const QHostAddress &address, const QString &configuration);
-    void sendActionRequest(Thing *thing, ThingActionInfo *info, const QString &configuration);
-    void setupMqttChannel(ThingSetupInfo *info, const QHostAddress &address, const QVariantMap &statusMap);
+    QNetworkRequest buildConfigurationRequest(Thing *thing, const QUrlQuery &configuration);
+
+    void executeEnableCharging(ThingActionInfo *info, bool enabled);
+    void executeSetChargingCurrent(ThingActionInfo *info, uint ampere);
+    void executeSetMaxAllowedCurrent(ThingActionInfo *info, uint ampere);
+
+    void sendActionRequest(Thing *thing, ThingActionInfo *info, const QString &configuration, ApiVersion apiVersion = ApiVersion2);
+    QNetworkReply *sendActionReply(Thing *thing, const QString &configuration);
+
+    void setupMqttChannel(ThingSetupInfo *info, const QVariantMap &statusMap);
+    void reconfigureMqttChannel(Thing *thing, const QVariantMap &statusMap);
+
+    // Helpers
+    QHostAddress getHostAddress(Thing *thing);
+    ApiVersion getApiVersion(Thing *thing);
+
 
 private slots:
     void refreshHttp();
+    void refreshHttpThing(Thing *thing);
 
     void onClientConnected(MqttChannel* channel);
     void onClientDisconnected(MqttChannel* channel);
-    void onPublishReceived(MqttChannel* channel, const QString &topic, const QByteArray &payload);
 
 };
 

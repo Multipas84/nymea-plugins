@@ -38,6 +38,8 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 
+#include "goediscovery.h"
+
 // API documentation: https://github.com/goecharger/go-eCharger-API-v1
 
 IntegrationPluginGoECharger::IntegrationPluginGoECharger()
@@ -53,44 +55,36 @@ void IntegrationPluginGoECharger::discoverThings(ThingDiscoveryInfo *info)
         return;
     }
 
-    // Perform a network device discovery and filter for "go-eCharger" hosts
-    NetworkDeviceDiscoveryReply *discoveryReply = hardwareManager()->networkDeviceDiscovery()->discover();
-    connect(discoveryReply, &NetworkDeviceDiscoveryReply::finished, this, [=](){
-        foreach (const NetworkDeviceInfo &networkDeviceInfo, discoveryReply->networkDeviceInfos()) {
-
-            qCDebug(dcGoECharger()) << "Checking discovered" << networkDeviceInfo;
-            // Filter by hostname
-            if (!networkDeviceInfo.hostName().toLower().contains("go-echarger"))
-                continue;
-
-            // We need also the mac address
-            if (networkDeviceInfo.macAddress().isEmpty())
-                continue;
-
+    GoeDiscovery *discovery = new GoeDiscovery(hardwareManager()->networkManager(), hardwareManager()->networkDeviceDiscovery(), this);
+    connect(discovery, &GoeDiscovery::discoveryFinished, discovery, &GoeDiscovery::deleteLater);
+    connect(discovery, &GoeDiscovery::discoveryFinished, info, [=](){
+        foreach (const GoeDiscovery::Result &result, discovery->discoveryResults()) {
             QString title;
-            if (networkDeviceInfo.hostName().isEmpty()) {
-                title = networkDeviceInfo.address().toString();
+            if (!result.product.isEmpty() && !result.friendlyName.isEmpty() && result.friendlyName != result.product) {
+                // We use the friendly name for the title, since the user seems to have given a name
+                title = result.friendlyName;
             } else {
-                title = "go-eCharger";
+                title = result.product;
             }
 
-            QString description;
-            if (networkDeviceInfo.macAddressManufacturer().isEmpty()) {
-                description = networkDeviceInfo.address().toString();
-            } else {
-                description = networkDeviceInfo.address().toString() + " (" + networkDeviceInfo.macAddressManufacturer() + ")";
+            // There might be an other OEM than go-e, let's use this information since the user might not look for go-e (whitelabel)
+            if (!result.manufacturer.isEmpty()) {
+                title += " (" + result.manufacturer + ")";
             }
 
+            QString description = "Serial: " + result.serialNumber + ", V: " + result.firmwareVersion + " - " + result.networkDeviceInfo.address().toString();
+            qCDebug(dcGoECharger()) << "-->" << title << description;
             ThingDescriptor descriptor(goeHomeThingClassId, title, description);
             ParamList params;
-            params << Param(goeHomeThingIpAddressParamTypeId, networkDeviceInfo.address().toString());
-            params << Param(goeHomeThingMacAddressParamTypeId, networkDeviceInfo.macAddress());
+            params << Param(goeHomeThingMacAddressParamTypeId, result.networkDeviceInfo.macAddress());
+            params << Param(goeHomeThingSerialNumberParamTypeId, result.serialNumber);
+            params << Param(goeHomeThingApiVersionParamTypeId, result.apiAvailableV2 ? 2 : 1);
             descriptor.setParams(params);
 
             // Check if we already have set up this device
-            Things existingThings = myThings().filterByParam(goeHomeThingMacAddressParamTypeId, networkDeviceInfo.macAddress());
+            Things existingThings = myThings().filterByParam(goeHomeThingMacAddressParamTypeId, result.networkDeviceInfo.macAddress());
             if (existingThings.count() == 1) {
-                qCDebug(dcGoECharger()) << "This go-eCharger already exists in the system" << networkDeviceInfo;
+                qCDebug(dcGoECharger()) << "This wallbox already exists in the system!" << result.networkDeviceInfo;
                 descriptor.setThingId(existingThings.first()->id());
             }
 
@@ -99,56 +93,86 @@ void IntegrationPluginGoECharger::discoverThings(ThingDiscoveryInfo *info)
 
         info->finish(Thing::ThingErrorNoError);
     });
+
+    // Start the discovery process
+    discovery->startDiscovery();
 }
 
 void IntegrationPluginGoECharger::setupThing(ThingSetupInfo *info)
 {
     Thing *thing = info->thing();
-    if (thing->thingClassId() == goeHomeThingClassId) {
-        QNetworkReply *reply = hardwareManager()->networkManager()->get(buildStatusRequest(thing));
-        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
-        connect(reply, &QNetworkReply::finished, info, [=](){
-            if (reply->error() != QNetworkReply::NoError) {
-                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
-                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
-                return;
-            }
+    qCDebug(dcGoECharger()) << "Set up" << thing << thing->params();
 
-            QByteArray data = reply->readAll();
-            QJsonParseError error;
-            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
-            if (error.error != QJsonParseError::NoError) {
-                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
-                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
-                return;
-            }
-
-            qCDebug(dcGoECharger()) << "Received" << qUtf8Printable(jsonDoc.toJson());
-            QVariantMap statusMap = jsonDoc.toVariant().toMap();
-            if (thing->paramValue(goeHomeThingUseMqttParamTypeId).toBool()) {
-
-                // Handle reconfigure
-                if (m_channels.contains(thing)) {
-                    hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
-                    // Continue with normal setup
-                }
-
-                // Verify mqtt client and set it up
-                qCDebug(dcGoECharger()) << "Setup using MQTT connection for" << thing;
-                QHostAddress address = QHostAddress(thing->paramValue(goeHomeThingIpAddressParamTypeId).toString());
-                setupMqttChannel(info, address, statusMap);
-            } else {
-                // Since we are not using mqtt, we are done with the setup, the refresh timer will be configured in post setup
-                info->finish(Thing::ThingErrorNoError);
-                qCDebug(dcGoECharger()) << "Setup using HTTP finished successfully";
-                update(thing, statusMap);
-                thing->setStateValue(goeHomeConnectedStateTypeId, true);
-            }
-        });
+    MacAddress macAddress = MacAddress(thing->paramValue(goeHomeThingMacAddressParamTypeId).toString());
+    if (!macAddress.isValid()) {
+        qCWarning(dcGoECharger()) << "The configured mac address is not valid" << thing->params();
+        info->finish(Thing::ThingErrorInvalidParameter, QT_TR_NOOP("The MAC address is not known. Please reconfigure the thing."));
         return;
     }
 
-    Q_ASSERT_X(false, "setupThing", QString("Unhandled thingClassId: %1").arg(thing->thingClassId().toString()).toUtf8());
+    // Create the monitor
+    NetworkDeviceMonitor *monitor = hardwareManager()->networkDeviceDiscovery()->registerMonitor(macAddress);
+    m_monitors.insert(thing, monitor);
+    QHostAddress address = getHostAddress(thing);
+    if (address.isNull()) {
+        qCWarning(dcGoECharger()) << "Cannot set up go-eCharger. The host address is not known yet. Maybe it will be available in the next run...";
+        hardwareManager()->networkDeviceDiscovery()->unregisterMonitor(m_monitors.take(thing));
+        info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The host address is not known yet. Trying later again."));
+        return;
+    }
+
+    // Clean up in case the setup gets aborted
+    connect(info, &ThingSetupInfo::aborted, monitor, [=](){
+        if (m_monitors.contains(thing)) {
+            qCDebug(dcGoECharger()) << "Unregister monitor because setup has been aborted.";
+            hardwareManager()->networkDeviceDiscovery()->unregisterMonitor(m_monitors.take(thing));
+        }
+    });
+
+    connect(monitor, &NetworkDeviceMonitor::reachableChanged, thing, [=](bool reachable){
+        qCDebug(dcGoECharger()) << "Network device monitor reachable changed for" << thing->name() << reachable;
+        if (reachable && thing->setupComplete() && !thing->stateValue("connected").toBool()) {
+            QNetworkReply *reply = hardwareManager()->networkManager()->get(buildStatusRequest(thing));
+            connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+            connect(reply, &QNetworkReply::finished, thing, [=](){
+                if (reply->error() != QNetworkReply::NoError) {
+                    qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                    return;
+                }
+
+                QByteArray data = reply->readAll();
+                QJsonParseError error;
+                QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+                if (error.error != QJsonParseError::NoError) {
+                    qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                    return;
+                }
+
+                qCDebug(dcGoECharger()) << "Initial status map" << qUtf8Printable(jsonDoc.toJson(QJsonDocument::Compact));
+                QVariantMap statusMap = jsonDoc.toVariant().toMap();
+                if (thing->paramValue(goeHomeThingUseMqttParamTypeId).toBool()) {
+                    // Reconfigure mqtt since also this host might have changed the ip
+                    reconfigureMqttChannel(thing, statusMap);
+                } else {
+                    // Refresh if http
+                    update(thing, statusMap);
+                }
+            });
+        }
+    });
+
+    // Wait for the monitor to be ready
+    if (monitor->reachable()) {
+        // Thing already reachable...let's finish the setup
+        setupGoeHome(info);
+    } else {
+        qCDebug(dcGoECharger()) << "Wait for the network monitor to get reachable";
+        connect(monitor, &NetworkDeviceMonitor::reachableChanged, info, [=](bool reachable){
+            if (reachable) {
+                setupGoeHome(info);
+            }
+        });
+    }
 }
 
 void IntegrationPluginGoECharger::postSetupThing(Thing *thing)
@@ -156,8 +180,9 @@ void IntegrationPluginGoECharger::postSetupThing(Thing *thing)
     if (thing->thingClassId() == goeHomeThingClassId) {
         // Set up refresh timer if needed and if we are not using mqtt
         if (!thing->paramValue(goeHomeThingUseMqttParamTypeId).toBool() && !m_refreshTimer) {
-            qCDebug(dcGoECharger()) << "Enabling HTTP refresh timer...";
-            m_refreshTimer = hardwareManager()->pluginTimerManager()->registerTimer(4);
+            // Recommended refresh rate from go-e: 5 seconds
+            qCDebug(dcGoECharger()) << "Enabling HTTP refresh timer using 5 seconds interval...";
+            m_refreshTimer = hardwareManager()->pluginTimerManager()->registerTimer(5);
             connect(m_refreshTimer, &PluginTimer::timeout, this, &IntegrationPluginGoECharger::refreshHttp);
             m_refreshTimer->start();
         }
@@ -166,6 +191,11 @@ void IntegrationPluginGoECharger::postSetupThing(Thing *thing)
 
 void IntegrationPluginGoECharger::thingRemoved(Thing *thing)
 {
+    // Clean up monitor
+    if (m_monitors.contains(thing)) {
+        hardwareManager()->networkDeviceDiscovery()->unregisterMonitor(m_monitors.take(thing));
+    }
+
     // Cleanup mqtt channels if set up
     if (m_channels.contains(thing)) {
         hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
@@ -199,52 +229,23 @@ void IntegrationPluginGoECharger::executeAction(ThingActionInfo *info)
         return;
     }
 
-    if (thing->stateValue(goeHomeSerialNumberStateTypeId).toString().isEmpty()) {
-        qCDebug(dcGoECharger()) << "Could not execute action because the serial number is missing.";
-        info->finish(Thing::ThingErrorHardwareFailure);
-        return;
-    }
-
     if (action.actionTypeId() == goeHomePowerActionTypeId) {
         bool power = action.paramValue(goeHomePowerActionPowerParamTypeId).toBool();
         qCDebug(dcGoECharger()) << "Setting charging allowed to" << power;
         // Set the allow value
-        QString configuration = QString("alw=%1").arg(power ? 1: 0);
-        sendActionRequest(thing, info, configuration);
+        executeEnableCharging(info, power);
         return;
     } else if (action.actionTypeId() == goeHomeMaxChargingCurrentActionTypeId) {
         uint maxChargingCurrent = action.paramValue(goeHomeMaxChargingCurrentActionMaxChargingCurrentParamTypeId).toUInt();
         qCDebug(dcGoECharger()) << "Setting max charging current to" << maxChargingCurrent << "A";
-        // FIXME: check if we can use amx since it is better for pv charging, not all version seen implement amx
-        // Maybe check if the user sets it or a automatism
-        QString configuration = QString("amp=%1").arg(maxChargingCurrent);
-        sendActionRequest(thing, info, configuration);
+        executeSetChargingCurrent(info, maxChargingCurrent);
         return;
-    } else if (action.actionTypeId() == goeHomeAbsoluteMaxAmpereActionTypeId) {
+    }/* else if (action.actionTypeId() == goeHomeAbsoluteMaxAmpereActionTypeId) {
         uint maxAmpere = action.paramValue(goeHomeAbsoluteMaxAmpereActionAbsoluteMaxAmpereParamTypeId).toUInt();
         qCDebug(dcGoECharger()) << "Setting absolute maximal charging amperes to" << maxAmpere << "A";
-        QString configuration = QString("ama=%1").arg(maxAmpere);
-        sendActionRequest(thing, info, configuration);
+        executeSetMaxAllowedCurrent(info, maxAmpere);
         return;
-    } else if (action.actionTypeId() == goeHomeCloudActionTypeId) {
-        bool enabled = action.paramValue(goeHomeCloudActionCloudParamTypeId).toBool();
-        qCDebug(dcGoECharger()) << "Set cloud" << (enabled ? "enabled" : "disabled");
-        QString configuration = QString("cdi=%1").arg(enabled ? 1: 0);
-        sendActionRequest(thing, info, configuration);
-        return;
-    } else if (action.actionTypeId() == goeHomeLedBrightnessActionTypeId) {
-        quint8 brightness = action.paramValue(goeHomeLedBrightnessActionLedBrightnessParamTypeId).toUInt();
-        qCDebug(dcGoECharger()) << "Set led brightnss to" << brightness << "/" << 255;
-        QString configuration = QString("lbr=%1").arg(brightness);
-        sendActionRequest(thing, info, configuration);
-        return;
-    } else if (action.actionTypeId() == goeHomeLedEnergySaveActionTypeId) {
-        bool enabled = action.paramValue(goeHomeLedEnergySaveActionLedEnergySaveParamTypeId).toBool();
-        qCDebug(dcGoECharger()) << "Set led energy saving" << (enabled ? "enabled" : "disabled");
-        QString configuration = QString("lse=%1").arg(enabled ? 1: 0);
-        sendActionRequest(thing, info, configuration);
-        return;
-    } else {
+    }*/ else {
         info->finish(Thing::ThingErrorActionTypeNotFound);
     }
 }
@@ -269,38 +270,18 @@ void IntegrationPluginGoECharger::onClientDisconnected(MqttChannel *channel)
         return;
     }
 
-    qCDebug(dcGoECharger()) << thing << "connected";
+    qCWarning(dcGoECharger()) << thing << "mqtt client disconnected";
     thing->setStateValue(goeHomeConnectedStateTypeId, false);
-}
-
-void IntegrationPluginGoECharger::onPublishReceived(MqttChannel *channel, const QString &topic, const QByteArray &payload)
-{
-    Thing *thing = m_channels.key(channel);
-    if (!thing) {
-        qCWarning(dcGoECharger()) << "Received a MQTT client publish from an unknown thing. Ignoring the event.";
-        return;
-    }
-
-    qCDebug(dcGoECharger()) << thing << "publish received" << topic;
-    QJsonParseError error;
-    QJsonDocument jsonDoc = QJsonDocument::fromJson(payload, &error);
-    if (error.error != QJsonParseError::NoError) {
-        qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(payload) << error.errorString();
-        return;
-    }
-
-    QString serialNumber = thing->stateValue(goeHomeSerialNumberStateTypeId).toString();
-    if (topic == QString("go-eCharger/%1/status").arg(serialNumber)) {
-        update(thing, jsonDoc.toVariant().toMap());
-    } else {
-        qCDebug(dcGoECharger()) << "Unhandled topic publish received:" << topic << qUtf8Printable(jsonDoc.toJson(QJsonDocument::Compact));
-    }
 }
 
 void IntegrationPluginGoECharger::update(Thing *thing, const QVariantMap &statusMap)
 {
-    if (thing->thingClassId() == goeHomeThingClassId) {
-        // Parse status map and update states...
+    ApiVersion apiVersion = getApiVersion(thing);
+
+    // Parse status map and update states...
+    // Note: update a state only if the property is actually in the statusMap
+
+    if (statusMap.contains("car")) {
         CarState carState = static_cast<CarState>(statusMap.value("car").toUInt());
         switch (carState) {
         case CarStateReadyNoCar:
@@ -313,16 +294,22 @@ void IntegrationPluginGoECharger::update(Thing *thing, const QVariantMap &status
             break;
         case CarStateWaitForCar:
             thing->setStateValue(goeHomeCarStatusStateTypeId, "Waiting for vehicle");
-            thing->setStateValue(goeHomePluggedInStateTypeId, false);
+            thing->setStateValue(goeHomePluggedInStateTypeId, true);
             break;
         case CarStateChargedCarConnected:
             thing->setStateValue(goeHomeCarStatusStateTypeId, "Charging finished and vehicle still connected");
             thing->setStateValue(goeHomePluggedInStateTypeId, true);
             break;
+        default:
+            thing->setStateValue(goeHomeCarStatusStateTypeId, "Unknown");
+            thing->setStateValue(goeHomePluggedInStateTypeId, false);
         }
 
         thing->setStateValue(goeHomeChargingStateTypeId, carState == CarStateCharging);
+    }
 
+
+    if (statusMap.contains("ast")) {
         Access accessStatus = static_cast<Access>(statusMap.value("ast").toUInt());
         switch (accessStatus) {
         case AccessOpen:
@@ -335,7 +322,9 @@ void IntegrationPluginGoECharger::update(Thing *thing, const QVariantMap &status
             thing->setStateValue(goeHomeAccessStateTypeId, "Automatic");
             break;
         }
+    }
 
+    if (statusMap.contains("tma")) {
         QVariantList temperatureSensorList = statusMap.value("tma").toList();
         if (temperatureSensorList.count() >= 1)
             thing->setStateValue(goeHomeTemperatureSensor1StateTypeId, temperatureSensorList.at(0).toDouble());
@@ -348,208 +337,651 @@ void IntegrationPluginGoECharger::update(Thing *thing, const QVariantMap &status
 
         if (temperatureSensorList.count() >= 4)
             thing->setStateValue(goeHomeTemperatureSensor4StateTypeId, temperatureSensorList.at(3).toDouble());
+    }
 
-        thing->setStateValue(goeHomeTotalEnergyConsumedStateTypeId, statusMap.value("eto").toUInt() / 10.0);
-        thing->setStateValue(goeHomeSessionEnergyStateTypeId, statusMap.value("dws").toUInt() / 360000.0);
+    if (statusMap.contains("eto")) {
+        if (apiVersion == ApiVersion2) {
+            thing->setStateValue(goeHomeTotalEnergyConsumedStateTypeId, statusMap.value("eto").toUInt() / 1000.0); // Wh -> kWh
+        } else {
+            thing->setStateValue(goeHomeTotalEnergyConsumedStateTypeId, statusMap.value("eto").toUInt() / 10.0); // unit = 0.1 kWh -> 130 = 13 kWh
+        }
+    }
+
+    if (apiVersion == ApiVersion1) {
+        if (statusMap.contains("dws")) {
+            thing->setStateValue(goeHomeSessionEnergyStateTypeId, statusMap.value("dws").toUInt() / 360000.0);
+        }
+    }
+
+    if (apiVersion == ApiVersion2) {
+        if (statusMap.contains("wh")) {
+            thing->setStateValue(goeHomeSessionEnergyStateTypeId, statusMap.value("wh").toUInt() / 1000.0); // Wh -> kWh
+        }
+    }
+
+    if (statusMap.contains("alw"))
         thing->setStateValue(goeHomePowerStateTypeId, (statusMap.value("alw").toUInt() == 0 ? false : true));
+
+    if (statusMap.contains("upd"))
         thing->setStateValue(goeHomeUpdateAvailableStateTypeId, (statusMap.value("upd").toUInt() == 0 ? false : true));
-        thing->setStateValue(goeHomeCloudStateTypeId, (statusMap.value("cdi").toUInt() == 0 ? false : true));
+
+    if (statusMap.contains("fwv"))
         thing->setStateValue(goeHomeFirmwareVersionStateTypeId, statusMap.value("fwv").toString());
-        // FIXME: check if we can use amx since it is better for pv charging, not all version seen implement this
+
+    // FIXME: check if we can use amx since it is better for pv charging, not all version seen implement this
+    if (statusMap.contains("amp"))
         thing->setStateValue(goeHomeMaxChargingCurrentStateTypeId, statusMap.value("amp").toUInt());
-        thing->setStateValue(goeHomeLedBrightnessStateTypeId, statusMap.value("lbr").toUInt());
-        thing->setStateValue(goeHomeLedEnergySaveStateTypeId, statusMap.value("lse").toBool());
-        thing->setStateValue(goeHomeSerialNumberStateTypeId, statusMap.value("sse").toString());
+
+    if (statusMap.contains("adi"))
         thing->setStateValue(goeHomeAdapterConnectedStateTypeId, (statusMap.value("adi").toUInt() == 0 ? false : true));
 
-        uint amaLimit = statusMap.value("ama").toUInt();
-        uint cableLimit = statusMap.value("cbl").toUInt();
+    if (statusMap.contains("fhz"))
+        thing->setStateValue(goeHomeFrequencyStateTypeId, statusMap.value("fhz").toDouble());
 
-        thing->setStateValue(goeHomeAbsoluteMaxAmpereStateTypeId, amaLimit);
-        thing->setStateValue(goeHomeCableType2AmpereStateTypeId, cableLimit);
+    if (statusMap.contains("cbl"))
+        thing->setStateValue(goeHomeCableType2AmpereStateTypeId, statusMap.value("cbl").toUInt());
 
-        // Set the limit for the max charging amps
+    if (statusMap.contains("ama"))
+        thing->setStateValue(goeHomeAbsoluteMaxAmpereStateTypeId, statusMap.value("ama").toUInt());
+
+    if (statusMap.contains("var")) {
+        uint variant = statusMap.value("var").toUInt();
+        uint variantLimit = 16; // 11 kW
+        if (variant == 22) // 22 kW
+            variantLimit = 32;
+
+        thing->setStateValue(goeHomeModelMaxAmpereStateTypeId, variantLimit);
+    }
+
+    if (statusMap.contains("cbl") || statusMap.contains("ama")) {
+        // Check charging limits
+        uint amaLimit = thing->stateValue(goeHomeAbsoluteMaxAmpereStateTypeId).toUInt();
+        uint cableLimit = thing->stateValue(goeHomeCableType2AmpereStateTypeId).toUInt();
+        uint modelLimit = thing->stateValue(goeHomeModelMaxAmpereStateTypeId).toUInt();
+
+        uint finalLimit = 0;
         if (cableLimit != 0) {
-            thing->setStateMaxValue(goeHomeMaxChargingCurrentStateTypeId, qMin(amaLimit, cableLimit));
+            finalLimit = qMin(amaLimit, cableLimit);
         } else {
-            thing->setStateMaxValue(goeHomeMaxChargingCurrentStateTypeId, amaLimit);
+            finalLimit = amaLimit;
         }
+        // Check hardware variant: 11 -> 16A and 22 -> 32A
+        if (modelLimit != 0)
+            finalLimit = qMin(finalLimit, modelLimit);
 
+        thing->setStateMaxValue(goeHomeMaxChargingCurrentStateTypeId, finalLimit);
+    }
+
+    if (statusMap.contains("pnp") && statusMap.value("pnp").toUInt() != 0)
+        thing->setStateValue(goeHomePhaseCountStateTypeId, statusMap.value("pnp").toUInt());
+
+    if (statusMap.contains("nrg")) {
         // Parse nrg array
         uint voltagePhaseA = 0; uint voltagePhaseB = 0; uint voltagePhaseC = 0;
         double amperePhaseA = 0; double amperePhaseB = 0; double amperePhaseC = 0;
         double currentPower = 0; double powerPhaseA = 0; double powerPhaseB = 0; double powerPhaseC = 0;
-
         QVariantList measurementList = statusMap.value("nrg").toList();
-        if (measurementList.count() >= 1)
-            voltagePhaseA = measurementList.at(0).toUInt();
 
-        if (measurementList.count() >= 2)
-            voltagePhaseB = measurementList.at(1).toUInt();
+        if (apiVersion == ApiVersion1) {
 
-        if (measurementList.count() >= 3)
-            voltagePhaseC = measurementList.at(2).toUInt();
+            if (measurementList.count() >= 1)
+                voltagePhaseA = measurementList.at(0).toUInt();
 
-        if (measurementList.count() >= 5)
-            amperePhaseA = measurementList.at(4).toUInt() / 10.0; // 0,1 A value 123 -> 12,3 A
+            if (measurementList.count() >= 2)
+                voltagePhaseB = measurementList.at(1).toUInt();
 
-        if (measurementList.count() >= 6)
-            amperePhaseB = measurementList.at(5).toUInt() / 10.0; // 0,1 A value 123 -> 12,3 A
+            if (measurementList.count() >= 3)
+                voltagePhaseC = measurementList.at(2).toUInt();
 
-        if (measurementList.count() >= 7)
-            amperePhaseC = measurementList.at(6).toUInt() / 10.0; // 0,1 A value 123 -> 12,3 A
+            if (measurementList.count() >= 5)
+                amperePhaseA = measurementList.at(4).toUInt() / 10.0; // 0,1 A value 123 -> 12,3 A
 
-        if (measurementList.count() >= 8)
-            powerPhaseA = measurementList.at(7).toUInt() * 100.0; // 0.1kW -> W
+            if (measurementList.count() >= 6)
+                amperePhaseB = measurementList.at(5).toUInt() / 10.0; // 0,1 A value 123 -> 12,3 A
 
-        if (measurementList.count() >= 9)
-            powerPhaseB = measurementList.at(8).toUInt() * 100.0; // 0.1kW -> W
+            if (measurementList.count() >= 7)
+                amperePhaseC = measurementList.at(6).toUInt() / 10.0; // 0,1 A value 123 -> 12,3 A
 
-        if (measurementList.count() >= 10)
-            powerPhaseC = measurementList.at(9).toUInt() * 100.0; // 0.1kW -> W
+            if (measurementList.count() >= 8)
+                powerPhaseA = measurementList.at(7).toUInt() * 100.0; // 0.1kW -> W
 
-        if (measurementList.count() >= 12)
-            currentPower = measurementList.at(11).toUInt() * 10.0; // 0.01kW -> W
+            if (measurementList.count() >= 9)
+                powerPhaseB = measurementList.at(8).toUInt() * 100.0; // 0.1kW -> W
 
-        // Update all states
-        thing->setStateValue(goeHomeVoltagePhaseAStateTypeId, voltagePhaseA);
-        thing->setStateValue(goeHomeVoltagePhaseBStateTypeId, voltagePhaseB);
-        thing->setStateValue(goeHomeVoltagePhaseCStateTypeId, voltagePhaseC);
-        thing->setStateValue(goeHomeCurrentPhaseAStateTypeId, amperePhaseA);
-        thing->setStateValue(goeHomeCurrentPhaseBStateTypeId, amperePhaseB);
-        thing->setStateValue(goeHomeCurrentPhaseCStateTypeId, amperePhaseC);
-        thing->setStateValue(goeHomeCurrentPowerPhaseAStateTypeId, powerPhaseA);
-        thing->setStateValue(goeHomeCurrentPowerPhaseBStateTypeId, powerPhaseB);
-        thing->setStateValue(goeHomeCurrentPowerPhaseCStateTypeId, powerPhaseC);
+            if (measurementList.count() >= 10)
+                powerPhaseC = measurementList.at(9).toUInt() * 100.0; // 0.1kW -> W
 
-        thing->setStateValue(goeHomeCurrentPowerStateTypeId, currentPower);
+            if (measurementList.count() >= 12)
+                currentPower = measurementList.at(11).toUInt() * 10.0; // 0.01kW -> W
 
-        // Check how many phases are actually charging, and update the phase count only if something happens on the phases (current or power)
-        if (amperePhaseA != 0 || amperePhaseB != 0 || amperePhaseC != 0) {
-            uint phaseCount = 0;
-            if (amperePhaseA != 0)
-                phaseCount += 1;
+            // Update all states
+            thing->setStateValue(goeHomeVoltagePhaseAStateTypeId, voltagePhaseA);
+            thing->setStateValue(goeHomeVoltagePhaseBStateTypeId, voltagePhaseB);
+            thing->setStateValue(goeHomeVoltagePhaseCStateTypeId, voltagePhaseC);
+            thing->setStateValue(goeHomeCurrentPhaseAStateTypeId, amperePhaseA);
+            thing->setStateValue(goeHomeCurrentPhaseBStateTypeId, amperePhaseB);
+            thing->setStateValue(goeHomeCurrentPhaseCStateTypeId, amperePhaseC);
+            thing->setStateValue(goeHomeCurrentPowerPhaseAStateTypeId, powerPhaseA);
+            thing->setStateValue(goeHomeCurrentPowerPhaseBStateTypeId, powerPhaseB);
+            thing->setStateValue(goeHomeCurrentPowerPhaseCStateTypeId, powerPhaseC);
 
-            if (amperePhaseB != 0)
-                phaseCount += 1;
+            thing->setStateValue(goeHomeCurrentPowerStateTypeId, currentPower);
 
-            if (amperePhaseC != 0)
-                phaseCount += 1;
+            // Check how many phases are actually charging, and update the phase count only if something happens on the phases (current or power)
+            if (amperePhaseA != 0 || amperePhaseB != 0 || amperePhaseC != 0) {
+                uint phaseCount = 0;
+                if (amperePhaseA != 0)
+                    phaseCount += 1;
 
-            thing->setStateValue(goeHomePhaseCountStateTypeId, phaseCount);
+                if (amperePhaseB != 0)
+                    phaseCount += 1;
+
+                if (amperePhaseC != 0)
+                    phaseCount += 1;
+
+                // Use this loginc only if we don't have pnp available
+                if (!statusMap.contains("pnp") || statusMap.value("pnp").toUInt() == 0) {
+                    thing->setStateValue(goeHomePhaseCountStateTypeId, phaseCount);
+                }
+            }
+        } else if (apiVersion == ApiVersion2) {
+
+            if (measurementList.count() >= 1)
+                voltagePhaseA = measurementList.at(0).toUInt();
+
+            if (measurementList.count() >= 2)
+                voltagePhaseB = measurementList.at(1).toUInt();
+
+            if (measurementList.count() >= 3)
+                voltagePhaseC = measurementList.at(2).toUInt();
+
+            if (measurementList.count() >= 5)
+                amperePhaseA = measurementList.at(4).toUInt();
+
+            if (measurementList.count() >= 6)
+                amperePhaseB = measurementList.at(5).toUInt();
+
+            if (measurementList.count() >= 7)
+                amperePhaseC = measurementList.at(6).toUInt();
+
+            if (measurementList.count() >= 8)
+                powerPhaseA = measurementList.at(7).toUInt();
+            if (measurementList.count() >= 9)
+                powerPhaseB = measurementList.at(8).toUInt() ;
+
+            if (measurementList.count() >= 10)
+                powerPhaseC = measurementList.at(9).toUInt();
+
+            if (measurementList.count() >= 12)
+                currentPower = measurementList.at(11).toUInt();
+
+            // Update all states
+            thing->setStateValue(goeHomeVoltagePhaseAStateTypeId, voltagePhaseA);
+            thing->setStateValue(goeHomeVoltagePhaseBStateTypeId, voltagePhaseB);
+            thing->setStateValue(goeHomeVoltagePhaseCStateTypeId, voltagePhaseC);
+            thing->setStateValue(goeHomeCurrentPhaseAStateTypeId, amperePhaseA);
+            thing->setStateValue(goeHomeCurrentPhaseBStateTypeId, amperePhaseB);
+            thing->setStateValue(goeHomeCurrentPhaseCStateTypeId, amperePhaseC);
+            thing->setStateValue(goeHomeCurrentPowerPhaseAStateTypeId, powerPhaseA);
+            thing->setStateValue(goeHomeCurrentPowerPhaseBStateTypeId, powerPhaseB);
+            thing->setStateValue(goeHomeCurrentPowerPhaseCStateTypeId, powerPhaseC);
+
+            thing->setStateValue(goeHomeCurrentPowerStateTypeId, currentPower);
+
+            // Check how many phases are actually charging, and update the phase count only if something happens on the phases (current or power)
+            if (amperePhaseA != 0 || amperePhaseB != 0 || amperePhaseC != 0) {
+                uint phaseCount = 0;
+                if (amperePhaseA != 0)
+                    phaseCount += 1;
+
+                if (amperePhaseB != 0)
+                    phaseCount += 1;
+
+                if (amperePhaseC != 0)
+                    phaseCount += 1;
+
+                // Use this loginc only if we don't have pnp available
+                if (!statusMap.contains("pnp") || statusMap.value("pnp").toUInt() == 0) {
+                    thing->setStateValue(goeHomePhaseCountStateTypeId, phaseCount);
+                }
+            }
         }
     }
+}
+
+void IntegrationPluginGoECharger::setupGoeHome(ThingSetupInfo *info)
+{
+    Thing *thing = info->thing();
+    QNetworkReply *reply = hardwareManager()->networkManager()->get(buildStatusRequest(thing));
+    connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+    connect(reply, &QNetworkReply::finished, info, [=](){
+        if (reply->error() != QNetworkReply::NoError) {
+            qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+            info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+            hardwareManager()->networkDeviceDiscovery()->unregisterMonitor(m_monitors.take(thing));
+            return;
+        }
+
+        QByteArray data = reply->readAll();
+        QJsonParseError error;
+        QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+        if (error.error != QJsonParseError::NoError) {
+            qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+            info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+            hardwareManager()->networkDeviceDiscovery()->unregisterMonitor(m_monitors.take(thing));
+            return;
+        }
+
+        // Handle reconfigure
+        if (m_channels.contains(thing))
+            hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
+
+        if (m_pendingReplies.contains(thing))
+            m_pendingReplies.take(thing)->abort();
+
+        qCDebug(dcGoECharger()) << "Initial status map" << qUtf8Printable(jsonDoc.toJson(QJsonDocument::Compact));
+        QVariantMap statusMap = jsonDoc.toVariant().toMap();
+
+        // Handle reconfigure
+        if (m_channels.contains(thing)) {
+            hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
+            // Continue with normal setup
+        }
+
+        if (thing->paramValue(goeHomeThingUseMqttParamTypeId).toBool()) {
+            // Verify mqtt client and set it up
+            qCDebug(dcGoECharger()) << "Setup using MQTT connection for" << thing;
+            setupMqttChannel(info, statusMap);
+        } else {
+            // Since we are not using mqtt, we are done with the setup, the refresh timer will be configured in post setup
+            info->finish(Thing::ThingErrorNoError);
+            qCDebug(dcGoECharger()) << "Setup using HTTP finished successfully";
+            update(thing, statusMap);
+            thing->setStateValue(goeHomeConnectedStateTypeId, true);
+        }
+    });
 }
 
 QNetworkRequest IntegrationPluginGoECharger::buildStatusRequest(Thing *thing)
 {
-    QHostAddress address = QHostAddress(thing->paramValue(goeHomeThingIpAddressParamTypeId).toString());
+    QHostAddress address = getHostAddress(thing);
+    ApiVersion apiVersion = getApiVersion(thing);
+
     QUrl requestUrl;
     requestUrl.setScheme("http");
     requestUrl.setHost(address.toString());
-    requestUrl.setPath("/status");
 
-    return QNetworkRequest(requestUrl);
-}
-
-QNetworkRequest IntegrationPluginGoECharger::buildConfigurationRequest(const QHostAddress &address, const QString &configuration)
-{
-    QUrl requestUrl;
-    requestUrl.setScheme("http");
-    requestUrl.setHost(address.toString());
-    requestUrl.setPath("/mqtt");
-    QUrlQuery query;
-    query.addQueryItem("payload", configuration);
-    requestUrl.setQuery(query);
-    return QNetworkRequest(requestUrl);
-}
-
-void IntegrationPluginGoECharger::sendActionRequest(Thing *thing, ThingActionInfo *info, const QString &configuration)
-{
-    // Lets use rest here since we get a reply on the rest request. For using MQTT publish to topic "go-eCharger/<serialnumber>/cmd/req"
-    QNetworkRequest request = buildConfigurationRequest(QHostAddress(thing->paramValue(goeHomeThingIpAddressParamTypeId).toString()), configuration);
-    QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
-    connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
-    connect(reply, &QNetworkReply::finished, info, [=](){
-        if (reply->error() != QNetworkReply::NoError) {
-            qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
-            info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
-            return;
-        }
-
-        QByteArray data = reply->readAll();
-        QJsonParseError error;
-        QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
-        if (error.error != QJsonParseError::NoError) {
-            qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
-            info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
-            return;
-        }
-
-        info->finish(Thing::ThingErrorNoError);
-        update(thing, jsonDoc.toVariant().toMap());
-    });
-}
-
-void IntegrationPluginGoECharger::setupMqttChannel(ThingSetupInfo *info, const QHostAddress &address, const QVariantMap &statusMap)
-{
-    Thing *thing = info->thing();
-    QString serialNumber = statusMap.value("sse").toString();
-    QString clientId = QString("go-eCharger:%1:%2").arg(serialNumber).arg(statusMap.value("rbc").toInt());
-    QString statusTopic = QString("go-eCharger/%1/status").arg(serialNumber);
-    QString commandTopic = QString("go-eCharger/%1/cmd/req").arg(serialNumber);
-    qCDebug(dcGoECharger()) << "Setting up mqtt channel for" << thing << address.toString() << statusTopic << commandTopic;
-
-    MqttChannel *channel = hardwareManager()->mqttProvider()->createChannel(clientId, address, {statusTopic, commandTopic});
-    if (!channel) {
-        qCWarning(dcGoECharger()) << "Failed to create MQTT channel for" << thing;
-        info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("Error creating MQTT channel. Please check MQTT server settings."));
-        return;
+    switch (apiVersion) {
+    case ApiVersion1:
+        requestUrl.setPath("/status");
+        break;
+    case ApiVersion2:
+        requestUrl.setPath("/api/status");
+        break;
     }
 
-    m_channels.insert(thing, channel);
-    connect(channel, &MqttChannel::clientConnected, this, &IntegrationPluginGoECharger::onClientConnected);
-    connect(channel, &MqttChannel::clientDisconnected, this, &IntegrationPluginGoECharger::onClientDisconnected);
-    connect(channel, &MqttChannel::publishReceived, this, &IntegrationPluginGoECharger::onPublishReceived);
+    return QNetworkRequest(requestUrl);
+}
 
-    // Configure the mqtt server on the go-e
-    QNetworkRequest request = buildConfigurationRequest(address, QString("mcs=%1").arg(channel->serverAddress().toString()));
-    qCDebug(dcGoECharger()) << "Configure nymea mqtt server address on" << thing << request.url().toString();
-    QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
-    connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
-    connect(reply, &QNetworkReply::finished, info, [=](){
-        if (reply->error() != QNetworkReply::NoError) {
-            qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
-            info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
-            return;
-        }
+QNetworkRequest IntegrationPluginGoECharger::buildConfigurationRequest(Thing *thing, const QUrlQuery &configuration)
+{
+    QHostAddress address = getHostAddress(thing);
+    ApiVersion apiVersion = getApiVersion(thing);
 
-        QByteArray data = reply->readAll();
-        QJsonParseError error;
-        QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
-        if (error.error != QJsonParseError::NoError) {
-            qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
-            info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
-            return;
-        }
+    QUrl requestUrl;
+    requestUrl.setScheme("http");
+    requestUrl.setHost(address.toString());
 
-        // Verify response matches the requsted value
-        if (jsonDoc.toVariant().toMap().value("mcs").toString() != channel->serverAddress().toString()) {
-            qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server address" << channel->serverAddress().toString();
-            info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("Error while configuring MQTT settings on the wallbox."));
-            return;
-        } else {
-            qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->serverAddress().toString();
-        }
+    switch (apiVersion) {
+    case ApiVersion1: {
+        requestUrl.setPath("/mqtt");
+        // Not confusing at all...
+        QUrlQuery query;
+        query.addQueryItem("payload", configuration.toString());
+        requestUrl.setQuery(query);
+        break;
+    }
+    case ApiVersion2:
+        requestUrl.setPath("/api/set");
+        requestUrl.setQuery(configuration);
+        break;
+    }
 
-        // Configure the port
-        QNetworkRequest request = buildConfigurationRequest(address, QString("mcp=%1").arg(channel->serverPort()));
-        qCDebug(dcGoECharger()) << "Configure nymea mqtt server port on" << thing << request.url().toString();
+    return QNetworkRequest(requestUrl);
+}
+
+void IntegrationPluginGoECharger::executeEnableCharging(ThingActionInfo *info, bool enabled)
+{
+    Thing *thing = info->thing();
+    ApiVersion apiVersion = getApiVersion(thing);
+
+    QString configuration;
+    switch (apiVersion) {
+    case ApiVersion1:
+        configuration = QString("alw=%1").arg(enabled ? 1: 0);
+        sendActionRequest(thing, info, configuration);
+        break;
+    case ApiVersion2:
+        configuration = QString("frc=%1").arg(enabled ? "0": "1");
+        QNetworkReply *reply = sendActionReply(thing, configuration);
+        connect(reply, &QNetworkReply::finished, info, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "Execute action failed. HTTP reply returned error:" << thing->name() << reply->errorString() << reply->readAll();
+                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Execute action failed. Failed to parse data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+                return;
+            }
+
+            QVariantMap responseCode = jsonDoc.toVariant().toMap();
+            if (responseCode.value("frc", false).toBool()) {
+                qCDebug(dcGoECharger()) << "Execute action finished successfully. Power" << enabled;
+                info->finish(Thing::ThingErrorNoError);
+                thing->setStateValue("power", enabled);
+            } else {
+                qCWarning(dcGoECharger()) << "Action finished with error:" << responseCode.value("frc").toString();
+                info->finish(Thing::ThingErrorHardwareFailure);
+            }
+        });
+        break;
+    }
+}
+
+void IntegrationPluginGoECharger::executeSetChargingCurrent(ThingActionInfo *info, uint ampere)
+{
+    Thing *thing = info->thing();
+    ApiVersion apiVersion = getApiVersion(thing);
+    QString configuration = QString("amp=%1").arg(ampere);
+    switch (apiVersion) {
+    case ApiVersion1:
+        sendActionRequest(thing, info, configuration);
+        break;
+    case ApiVersion2:
+        QNetworkReply *reply = sendActionReply(thing, configuration);
+        connect(reply, &QNetworkReply::finished, info, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "Execute action failed. HTTP status reply returned error:" << thing->name() << reply->errorString() << reply->readAll();
+                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Execute action failed. Failed to parse data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+                return;
+            }
+
+            QVariantMap responseCode = jsonDoc.toVariant().toMap();
+            if (responseCode.value("amp", false).toBool()) {
+                qCDebug(dcGoECharger()) << "Execute action finished successfully. Charging current" << ampere;
+                info->finish(Thing::ThingErrorNoError);
+                thing->setStateValue("maxChargingCurrent", ampere);
+            } else {
+                qCWarning(dcGoECharger()) << "Action finished with error:" << responseCode.value("amp").toString();
+                info->finish(Thing::ThingErrorHardwareFailure);
+            }
+        });
+        break;
+    }
+}
+
+void IntegrationPluginGoECharger::executeSetMaxAllowedCurrent(ThingActionInfo *info, uint ampere)
+{
+    Thing *thing = info->thing();
+    ApiVersion apiVersion = getApiVersion(thing);
+    QString configuration = QString("ama=%1").arg(ampere);
+    switch (apiVersion) {
+    case ApiVersion1:
+        sendActionRequest(thing, info, configuration);
+        break;
+    case ApiVersion2:
+        QNetworkReply *reply = sendActionReply(thing, configuration);
+        connect(reply, &QNetworkReply::finished, info, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "Execute action failed. HTTP status reply returned error:" << thing->name() << reply->errorString() << reply->readAll();
+                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Execute action failed. Failed to parse data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+                return;
+            }
+
+            QVariantMap responseCode = jsonDoc.toVariant().toMap();
+            if (responseCode.value("ama", false).toBool()) {
+                qCDebug(dcGoECharger()) << "Execute action finished successfully. Max allowed current" << ampere;
+                info->finish(Thing::ThingErrorNoError);
+                thing->setStateValue("absoluteMaxAmpere", ampere);
+            } else {
+                qCWarning(dcGoECharger()) << "Action finished with error:" << responseCode.value("ama").toString();
+                info->finish(Thing::ThingErrorHardwareFailure);
+            }
+        });
+        break;
+    }
+}
+
+void IntegrationPluginGoECharger::sendActionRequest(Thing *thing, ThingActionInfo *info, const QString &configuration, ApiVersion apiVersion)
+{
+    QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(configuration));
+    if (apiVersion == ApiVersion2) {
+        QNetworkReply *reply = hardwareManager()->networkManager()->get(request);
+        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+        connect(reply, &QNetworkReply::finished, info, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "HTTP reply returned error:" << reply->errorString() << reply->readAll();
+                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+                return;
+            }
+
+            qCDebug(dcGoECharger()) << "Execute action finished: Response" << qUtf8Printable(jsonDoc.toJson(QJsonDocument::Indented));
+
+            info->finish(Thing::ThingErrorNoError);
+        });
+
+    } else if (apiVersion == ApiVersion1) {
+        // Lets use rest here since we get a reply on the rest request. For using MQTT publish to topic "go-eCharger/<serialnumber>/cmd/req"
+        QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(configuration));
         QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
         connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
         connect(reply, &QNetworkReply::finished, info, [=](){
             if (reply->error() != QNetworkReply::NoError) {
-                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
+                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+                return;
+            }
+
+            info->finish(Thing::ThingErrorNoError);
+            update(thing, jsonDoc.toVariant().toMap());
+        });
+    }
+}
+
+QNetworkReply *IntegrationPluginGoECharger::sendActionReply(Thing *thing, const QString &configuration)
+{
+    QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(configuration));
+    QNetworkReply *reply = nullptr;
+    ApiVersion apiVersion = getApiVersion(thing);
+    if (apiVersion == ApiVersion2) {
+        reply = hardwareManager()->networkManager()->get(request);
+        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+    } else {
+        QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(configuration));
+        reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
+    }
+
+    return reply;
+}
+
+void IntegrationPluginGoECharger::setupMqttChannel(ThingSetupInfo *info, const QVariantMap &statusMap)
+{
+    Thing *thing = info->thing();
+
+    QHostAddress address = getHostAddress(thing);
+    QString serialNumber = statusMap.value("sse").toString();
+    ApiVersion apiVersion = getApiVersion(thing);
+
+    // Configure the mqtt server on the go-e
+    if (apiVersion == ApiVersion2) {
+        // At least in version 51.1
+        QString clientId = QString("go-echarger_%1").arg(serialNumber);
+        QString statusTopic = QString("/go-eCharger/%1/#").arg(serialNumber);
+        qCDebug(dcGoECharger()) << "Setting up mqtt channel for" << thing << address.toString() << statusTopic;
+
+        // Somehow limited to 8 characters...
+        QString username = QString::fromUtf8(QUuid::createUuid().toByteArray().toHex().left(8));
+        QString password = QString::fromUtf8(QUuid::createUuid().toByteArray().toHex().left(8));
+
+        MqttChannel *channel = hardwareManager()->mqttProvider()->createChannel(clientId, username, password, address, {statusTopic});
+        if (!channel) {
+            qCWarning(dcGoECharger()) << "Failed to create MQTT channel for" << thing;
+            info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("Error creating MQTT channel. Please check MQTT server settings."));
+            return;
+        }
+
+        m_channels.insert(thing, channel);
+        connect(channel, &MqttChannel::clientConnected, this, &IntegrationPluginGoECharger::onClientConnected);
+        connect(channel, &MqttChannel::clientDisconnected, this, &IntegrationPluginGoECharger::onClientDisconnected);
+
+        // Build the mqtt url
+        QUrl mqttUrl;
+        mqttUrl.setScheme("mqtt");
+        mqttUrl.setHost(channel->serverAddress().toString());
+        mqttUrl.setPort(channel->serverPort());
+        mqttUrl.setUserName(channel->username());
+        mqttUrl.setPassword(channel->password());
+
+        // The query item must be JSON encoded, meaning: strings need quouts... for whatever reason...
+        QUrlQuery query;
+        query.addQueryItem("mcu", "\"" + mqttUrl.toString() + "\"");
+        query.addQueryItem("mce", "true");
+
+        QNetworkRequest request = buildConfigurationRequest(thing, query);
+        qCDebug(dcGoECharger()) << "Configure nymea mqtt server address on" << thing << request.url().toString();
+        QNetworkReply *reply = hardwareManager()->networkManager()->get(request);
+        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+        connect(reply, &QNetworkReply::finished, info, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Failed to set mqtt configuration for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+                return;
+            }
+
+            qCDebug(dcGoECharger()) << qUtf8Printable(jsonDoc.toJson());
+
+            info->finish(Thing::ThingErrorNoError);
+            qCDebug(dcGoECharger()) << "Configuration of MQTT for" << thing << "finished successfully";
+            // Update states...
+            update(thing, statusMap);
+
+            // From now on we listen to topics
+            connect(channel, &MqttChannel::publishReceived, thing, [=](MqttChannel* channel, const QString &topic, const QByteArray &payload){
+                QString propertyKey = topic.split("/").last();
+                QString propertyValue = QString::fromUtf8(payload);
+                // Well...no better idea for now to keep the APIs / parsing methods
+                // compatible trought different APIs and protocols
+                QString statusMapJsonString = QString("{\"%1\":%2}").arg(propertyKey).arg(propertyValue);
+                QJsonDocument jsonDoc = QJsonDocument::fromJson(statusMapJsonString.toUtf8());
+
+                // Mute the spaming stuff..
+                if (propertyKey != "fhz" && propertyKey != "rssi" && propertyKey != "utc" && propertyKey != "loc" && propertyKey != "rbt") {
+                    qCDebug(dcGoECharger()) << thing->name() << channel->clientId() << "publish received" << topic << payload;
+                    //qCDebug(dcGoECharger()) << "-->" << jsonDoc.toJson(QJsonDocument::Compact);
+                }
+                update(thing, jsonDoc.toVariant().toMap());
+            });
+
+        });
+    } else if (apiVersion == ApiVersion1) {
+
+        // at least in version 30.1
+        QString clientId = QString("go-eCharger:%1:%2").arg(serialNumber).arg(statusMap.value("rbc").toInt());
+        QString statusTopic = QString("/go-eCharger/%1/status").arg(serialNumber);
+        QString commandTopic = QString("/go-eCharger/%1/cmd/req").arg(serialNumber);
+        qCDebug(dcGoECharger()) << "Setting up mqtt channel for" << thing << address.toString() << statusTopic << commandTopic;
+
+        MqttChannel *channel = hardwareManager()->mqttProvider()->createChannel(clientId, address, {statusTopic, commandTopic});
+        if (!channel) {
+            qCWarning(dcGoECharger()) << "Failed to create MQTT channel for" << thing;
+            info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("Error creating MQTT channel. Please check MQTT server settings."));
+            return;
+        }
+
+        m_channels.insert(thing, channel);
+        connect(channel, &MqttChannel::clientConnected, this, &IntegrationPluginGoECharger::onClientConnected);
+        connect(channel, &MqttChannel::clientDisconnected, this, &IntegrationPluginGoECharger::onClientDisconnected);
+        connect(channel, &MqttChannel::publishReceived, thing, [=](MqttChannel* channel, const QString &topic, const QByteArray &payload){
+            Thing *thing = m_channels.key(channel);
+            if (!thing) {
+                qCWarning(dcGoECharger()) << "Received a MQTT client publish from an unknown thing. Ignoring the event.";
+                return;
+            }
+
+            qCDebug(dcGoECharger()) << thing << "publish received" << topic;
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(payload, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(payload) << error.errorString();
+                return;
+            }
+
+            QString serialNumber = thing->paramValue(goeHomeThingSerialNumberParamTypeId).toString();
+            if (topic == QString("go-eCharger/%1/status").arg(serialNumber)) {
+                update(thing, jsonDoc.toVariant().toMap());
+            } else {
+                qCDebug(dcGoECharger()) << "Unhandled topic publish received:" << topic << qUtf8Printable(jsonDoc.toJson(QJsonDocument::Compact));
+            }
+        } );
+
+        QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mcs=%1").arg(channel->serverAddress().toString())));
+        qCDebug(dcGoECharger()) << "Configure nymea mqtt server address on" << thing << request.url().toString();
+        QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
+        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+        connect(reply, &QNetworkReply::finished, info, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
                 info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
                 return;
             }
@@ -564,22 +996,22 @@ void IntegrationPluginGoECharger::setupMqttChannel(ThingSetupInfo *info, const Q
             }
 
             // Verify response matches the requsted value
-            if (jsonDoc.toVariant().toMap().value("mcp").toUInt() != channel->serverPort()) {
-                qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server port" << channel->serverPort();
+            if (jsonDoc.toVariant().toMap().value("mcs").toString() != channel->serverAddress().toString()) {
+                qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server address" << channel->serverAddress().toString();
                 info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("Error while configuring MQTT settings on the wallbox."));
                 return;
             } else {
-                qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->serverPort();
+                qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->serverAddress().toString();
             }
 
-            // Username
-            QNetworkRequest request = buildConfigurationRequest(address, QString("mcu=%1").arg(channel->username()));
-            qCDebug(dcGoECharger()) << "Configure nymea mqtt server user name on" << thing << request.url().toString();
+            // Configure the port
+            QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mcp=%1").arg(channel->serverPort())));
+            qCDebug(dcGoECharger()) << "Configure nymea mqtt server port on" << thing << request.url().toString();
             QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
             connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
             connect(reply, &QNetworkReply::finished, info, [=](){
                 if (reply->error() != QNetworkReply::NoError) {
-                    qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
+                    qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
                     info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
                     return;
                 }
@@ -594,22 +1026,22 @@ void IntegrationPluginGoECharger::setupMqttChannel(ThingSetupInfo *info, const Q
                 }
 
                 // Verify response matches the requsted value
-                if (jsonDoc.toVariant().toMap().value("mcu").toString() != channel->username()) {
-                    qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server username" << channel->username();
+                if (jsonDoc.toVariant().toMap().value("mcp").toUInt() != channel->serverPort()) {
+                    qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server port" << channel->serverPort();
                     info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("Error while configuring MQTT settings on the wallbox."));
                     return;
                 } else {
-                    qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->username();
+                    qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->serverPort();
                 }
 
-                // Password
-                QNetworkRequest request = buildConfigurationRequest(address, QString("mck=%1").arg(channel->password()));
-                qCDebug(dcGoECharger()) << "Configure nymea mqtt server password on" << thing << request.url().toString();
+                // Username
+                QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mcu=%1").arg(channel->username())));
+                qCDebug(dcGoECharger()) << "Configure nymea mqtt server user name on" << thing << request.url().toString();
                 QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
                 connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
                 connect(reply, &QNetworkReply::finished, info, [=](){
                     if (reply->error() != QNetworkReply::NoError) {
-                        qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
+                        qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
                         info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
                         return;
                     }
@@ -624,22 +1056,22 @@ void IntegrationPluginGoECharger::setupMqttChannel(ThingSetupInfo *info, const Q
                     }
 
                     // Verify response matches the requsted value
-                    if (jsonDoc.toVariant().toMap().value("mck").toString() != channel->password()) {
-                        qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server password" << channel->password();
+                    if (jsonDoc.toVariant().toMap().value("mcu").toString() != channel->username()) {
+                        qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server username" << channel->username();
                         info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("Error while configuring MQTT settings on the wallbox."));
                         return;
                     } else {
-                        qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->password();
+                        qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->username();
                     }
 
-                    // Enable MQTT
-                    QNetworkRequest request = buildConfigurationRequest(address, QString("mce=1"));
-                    qCDebug(dcGoECharger()) << "Enable custom mqtt server on" << thing << request.url().toString();
+                    // Password
+                    QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mck=%1").arg(channel->password())));
+                    qCDebug(dcGoECharger()) << "Configure nymea mqtt server password on" << thing << request.url().toString();
                     QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
                     connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
                     connect(reply, &QNetworkReply::finished, info, [=](){
                         if (reply->error() != QNetworkReply::NoError) {
-                            qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
+                            qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
                             info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
                             return;
                         }
@@ -654,52 +1086,224 @@ void IntegrationPluginGoECharger::setupMqttChannel(ThingSetupInfo *info, const Q
                         }
 
                         // Verify response matches the requsted value
-                        QVariantMap statusMap = jsonDoc.toVariant().toMap();
-                        if (statusMap.value("mce").toInt() != 1) {
-                            qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested value 1";
+                        if (jsonDoc.toVariant().toMap().value("mck").toString() != channel->password()) {
+                            qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server password" << channel->password();
                             info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("Error while configuring MQTT settings on the wallbox."));
                             return;
                         } else {
-                            qCDebug(dcGoECharger()) << "Configured successfully MQTT server enabled" << thing;
+                            qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->password();
                         }
 
-                        info->finish(Thing::ThingErrorNoError);
-                        qCDebug(dcGoECharger()) << "Configuration of MQTT for" << thing << "finished successfully";
-                        // Update states...
-                        update(thing, statusMap);
+                        // Enable MQTT
+                        QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mce=1")));
+                        qCDebug(dcGoECharger()) << "Enable custom mqtt server on" << thing << request.url().toString();
+                        QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
+                        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+                        connect(reply, &QNetworkReply::finished, info, [=](){
+                            if (reply->error() != QNetworkReply::NoError) {
+                                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("The wallbox does not seem to be reachable."));
+                                return;
+                            }
+
+                            QByteArray data = reply->readAll();
+                            QJsonParseError error;
+                            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+                            if (error.error != QJsonParseError::NoError) {
+                                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                                info->finish(Thing::ThingErrorHardwareFailure, QT_TR_NOOP("The wallbox returned invalid data."));
+                                return;
+                            }
+
+                            // Verify response matches the requsted value
+                            QVariantMap statusMap = jsonDoc.toVariant().toMap();
+                            if (statusMap.value("mce").toInt() != 1) {
+                                qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested value 1";
+                                info->finish(Thing::ThingErrorHardwareNotAvailable, QT_TR_NOOP("Error while configuring MQTT settings on the wallbox."));
+                                return;
+                            } else {
+                                qCDebug(dcGoECharger()) << "Configured successfully MQTT server enabled" << thing;
+                            }
+
+                            info->finish(Thing::ThingErrorNoError);
+                            qCDebug(dcGoECharger()) << "Configuration of MQTT for" << thing << "finished successfully";
+                            // Update states...
+                            update(thing, statusMap);
+                        });
                     });
                 });
             });
         });
-    });
+    }
 }
 
-void IntegrationPluginGoECharger::refreshHttp()
+void IntegrationPluginGoECharger::reconfigureMqttChannel(Thing *thing, const QVariantMap &statusMap)
 {
-    // Update all things which don't use mqtt
-    foreach (Thing *thing, myThings()) {
-        if (thing->thingClassId() != goeHomeThingClassId)
-            continue;
+    QString serialNumber = thing->paramValue(goeHomeThingSerialNumberParamTypeId).toString();
+    QHostAddress address = getHostAddress(thing);
+    ApiVersion apiVersion = getApiVersion(thing);
 
-        // Poll thing which if not using mqtt
-        if (!thing->paramValue(goeHomeThingUseMqttParamTypeId).toBool()) {
+    qCDebug(dcGoECharger()) << "Reconfigure mqtt channel for" << thing;
 
-            // Make sure there is not a request pending for this thing, otherwise wait for the next refresh
-            if (m_pendingReplies.contains(thing) && m_pendingReplies.value(thing))
-                continue;
+    // Configure the mqtt server on the go-e
+    if (apiVersion == ApiVersion2) {
+        // At least in version 51.1
+        QString clientId = QString("go-echarger_%1").arg(serialNumber);
+        QString statusTopic = QString("/go-eCharger/%1/#").arg(serialNumber);
+        qCDebug(dcGoECharger()) << "Reconfigure mqtt channel for" << thing << address.toString() << statusTopic;
 
-            qCDebug(dcGoECharger()) << "Refresh HTTP status from" << thing;
-            QNetworkReply *reply = hardwareManager()->networkManager()->get(buildStatusRequest(thing));
-            m_pendingReplies.insert(thing, reply);
+        // Somehow limited to 8 characters...
+        QString username = QString::fromUtf8(QUuid::createUuid().toByteArray().toHex().left(8));
+        QString password = QString::fromUtf8(QUuid::createUuid().toByteArray().toHex().left(8));
 
+        MqttChannel *channel = hardwareManager()->mqttProvider()->createChannel(clientId, username, password, address, {statusTopic});
+        if (!channel) {
+            qCWarning(dcGoECharger()) << "Failed to create MQTT channel for" << thing;
+            return;
+        }
+
+        // Clean up existing channel if there is one
+        if (m_channels.contains(thing)) {
+            qCDebug(dcGoECharger()) << "Release old mqtt channel...";
+            hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
+        }
+
+        m_channels.insert(thing, channel);
+        connect(channel, &MqttChannel::clientConnected, this, &IntegrationPluginGoECharger::onClientConnected);
+        connect(channel, &MqttChannel::clientDisconnected, this, &IntegrationPluginGoECharger::onClientDisconnected);
+
+        // Build the mqtt url
+        QUrl mqttUrl;
+        mqttUrl.setScheme("mqtt");
+        mqttUrl.setHost(channel->serverAddress().toString());
+        mqttUrl.setPort(channel->serverPort());
+        mqttUrl.setUserName(channel->username());
+        mqttUrl.setPassword(channel->password());
+
+        // The query item must be JSON encoded, meaning: strings need quouts... for whatever reason...
+        QUrlQuery query;
+        query.addQueryItem("mcu", "\"" + mqttUrl.toString() + "\"");
+
+        QNetworkRequest request = buildConfigurationRequest(thing, query);
+        qCDebug(dcGoECharger()) << "Configure nymea mqtt server address on" << thing << request.url().toString();
+        QNetworkReply *reply = hardwareManager()->networkManager()->get(request);
+        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+        connect(reply, &QNetworkReply::finished, thing, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Failed to set mqtt configuration for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
+                return;
+            }
+
+            QVariantMap responseCode = jsonDoc.toVariant().toMap();
+            if (!responseCode.value("mcu", false).toBool()) {
+                qCWarning(dcGoECharger()) << "Failed to configure mqtt on" << thing;
+                hardwareManager()->mqttProvider()->releaseChannel(m_channels.take(thing));
+                return;
+            }
+
+            qCDebug(dcGoECharger()) << "Configuration of MQTT for" << thing << "finished successfully";
+            // From now on we listen to topics
+            connect(channel, &MqttChannel::publishReceived, thing, [=](MqttChannel* channel, const QString &topic, const QByteArray &payload){
+                QString propertyKey = topic.split("/").last();
+                QString propertyValue = QString::fromUtf8(payload);
+                // Well...no better idea for now to keep the APIs / parsing methods
+                // compatible trought different APIs and protocols
+                QString statusMapJsonString = QString("{\"%1\":%2}").arg(propertyKey).arg(propertyValue);
+                QJsonDocument jsonDoc = QJsonDocument::fromJson(statusMapJsonString.toUtf8());
+
+                // Mute the spaming stuff..
+                if (propertyKey != "fhz" && propertyKey != "rssi" && propertyKey != "utc" && propertyKey != "loc" && propertyKey != "rbt") {
+                    qCDebug(dcGoECharger()) << thing->name() << channel->clientId() << "publish received" << topic << payload;
+                    //qCDebug(dcGoECharger()) << "-->" << jsonDoc.toJson(QJsonDocument::Compact);
+                }
+                update(thing, jsonDoc.toVariant().toMap());
+            });
+
+        });
+    } else if (apiVersion == ApiVersion1) {
+
+        // At least in version 30.1
+        QString clientId = QString("go-eCharger:%1:%2").arg(serialNumber).arg(statusMap.value("rbc").toInt());
+        QString statusTopic = QString("/go-eCharger/%1/status").arg(serialNumber);
+        QString commandTopic = QString("/go-eCharger/%1/cmd/req").arg(serialNumber);
+        qCDebug(dcGoECharger()) << "Setting up mqtt channel for" << thing << address.toString() << statusTopic << commandTopic;
+
+        MqttChannel *channel = hardwareManager()->mqttProvider()->createChannel(clientId, address, {statusTopic, commandTopic});
+        if (!channel) {
+            qCWarning(dcGoECharger()) << "Failed to create MQTT channel for" << thing;
+            return;
+        }
+
+        m_channels.insert(thing, channel);
+        connect(channel, &MqttChannel::clientConnected, this, &IntegrationPluginGoECharger::onClientConnected);
+        connect(channel, &MqttChannel::clientDisconnected, this, &IntegrationPluginGoECharger::onClientDisconnected);
+        connect(channel, &MqttChannel::publishReceived, thing, [=](MqttChannel* channel, const QString &topic, const QByteArray &payload){
+            Thing *thing = m_channels.key(channel);
+            if (!thing) {
+                qCWarning(dcGoECharger()) << "Received a MQTT client publish from an unknown thing. Ignoring the event.";
+                return;
+            }
+
+            qCDebug(dcGoECharger()) << thing << "publish received" << topic;
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(payload, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(payload) << error.errorString();
+                return;
+            }
+
+            QString serialNumber = thing->paramValue(goeHomeThingSerialNumberParamTypeId).toString();
+            if (topic == QString("go-eCharger/%1/status").arg(serialNumber)) {
+                update(thing, jsonDoc.toVariant().toMap());
+            } else {
+                qCDebug(dcGoECharger()) << "Unhandled topic publish received:" << topic << qUtf8Printable(jsonDoc.toJson(QJsonDocument::Compact));
+            }
+        } );
+
+        QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mcs=%1").arg(channel->serverAddress().toString())));
+        qCDebug(dcGoECharger()) << "Configure nymea mqtt server address on" << thing << request.url().toString();
+        QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
+        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+        connect(reply, &QNetworkReply::finished, thing, [=](){
+            if (reply->error() != QNetworkReply::NoError) {
+                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                return;
+            }
+
+            QByteArray data = reply->readAll();
+            QJsonParseError error;
+            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+            if (error.error != QJsonParseError::NoError) {
+                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                return;
+            }
+
+            // Verify response matches the requsted value
+            if (jsonDoc.toVariant().toMap().value("mcs").toString() != channel->serverAddress().toString()) {
+                qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server address" << channel->serverAddress().toString();
+                return;
+            } else {
+                qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->serverAddress().toString();
+            }
+
+            // Configure the port
+            QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mcp=%1").arg(channel->serverPort())));
+            qCDebug(dcGoECharger()) << "Configure nymea mqtt server port on" << thing << request.url().toString();
+            QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
             connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
             connect(reply, &QNetworkReply::finished, thing, [=](){
-                // We are done with this thing reply
-                m_pendingReplies.remove(thing);
-
                 if (reply->error() != QNetworkReply::NoError) {
-                    qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString();
-                    thing->setStateValue(goeHomeConnectedStateTypeId, false);
+                    qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
                     return;
                 }
 
@@ -708,19 +1312,179 @@ void IntegrationPluginGoECharger::refreshHttp()
                 QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
                 if (error.error != QJsonParseError::NoError) {
                     qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
-                    thing->setStateValue(goeHomeConnectedStateTypeId, false);
                     return;
                 }
 
-                // Valid json data received, connected true
-                thing->setStateValue(goeHomeConnectedStateTypeId, true);
+                // Verify response matches the requsted value
+                if (jsonDoc.toVariant().toMap().value("mcp").toUInt() != channel->serverPort()) {
+                    qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server port" << channel->serverPort();
+                    return;
+                } else {
+                    qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->serverPort();
+                }
 
-                qCDebug(dcGoECharger()) << "Received" << qUtf8Printable(jsonDoc.toJson());
-                QVariantMap statusMap = jsonDoc.toVariant().toMap();
-                update(thing, statusMap);
+                // Username
+                QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mcu=%1").arg(channel->username())));
+                qCDebug(dcGoECharger()) << "Configure nymea mqtt server user name on" << thing << request.url().toString();
+                QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
+                connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+                connect(reply, &QNetworkReply::finished, thing, [=](){
+                    if (reply->error() != QNetworkReply::NoError) {
+                        qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                        return;
+                    }
+
+                    QByteArray data = reply->readAll();
+                    QJsonParseError error;
+                    QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+                    if (error.error != QJsonParseError::NoError) {
+                        qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                        return;
+                    }
+
+                    // Verify response matches the requsted value
+                    if (jsonDoc.toVariant().toMap().value("mcu").toString() != channel->username()) {
+                        qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server username" << channel->username();
+                        return;
+                    } else {
+                        qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->username();
+                    }
+
+                    // Password
+                    QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mck=%1").arg(channel->password())));
+                    qCDebug(dcGoECharger()) << "Configure nymea mqtt server password on" << thing << request.url().toString();
+                    QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
+                    connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+                    connect(reply, &QNetworkReply::finished, thing, [=](){
+                        if (reply->error() != QNetworkReply::NoError) {
+                            qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                            return;
+                        }
+
+                        QByteArray data = reply->readAll();
+                        QJsonParseError error;
+                        QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+                        if (error.error != QJsonParseError::NoError) {
+                            qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                            return;
+                        }
+
+                        // Verify response matches the requsted value
+                        if (jsonDoc.toVariant().toMap().value("mck").toString() != channel->password()) {
+                            qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested server password" << channel->password();
+                            return;
+                        } else {
+                            qCDebug(dcGoECharger()) << "Configured successfully MQTT server" << thing << channel->password();
+                        }
+
+                        // Enable MQTT
+                        QNetworkRequest request = buildConfigurationRequest(thing, QUrlQuery(QString("mce=1")));
+                        qCDebug(dcGoECharger()) << "Enable custom mqtt server on" << thing << request.url().toString();
+                        QNetworkReply *reply = hardwareManager()->networkManager()->sendCustomRequest(request, "SET");
+                        connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+                        connect(reply, &QNetworkReply::finished, thing, [=](){
+                            if (reply->error() != QNetworkReply::NoError) {
+                                qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+                                return;
+                            }
+
+                            QByteArray data = reply->readAll();
+                            QJsonParseError error;
+                            QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+                            if (error.error != QJsonParseError::NoError) {
+                                qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+                                return;
+                            }
+
+                            // Verify response matches the requsted value
+                            QVariantMap statusMap = jsonDoc.toVariant().toMap();
+                            if (statusMap.value("mce").toInt() != 1) {
+                                qCWarning(dcGoECharger()) << "Configured MQTT server but the response does not match with requested value 1";
+                                return;
+                            } else {
+                                qCDebug(dcGoECharger()) << "Configured successfully MQTT server enabled" << thing;
+                            }
+
+                            qCDebug(dcGoECharger()) << "Configuration of MQTT for" << thing << "finished successfully";
+                            // Update states...
+                            update(thing, statusMap);
+                        });
+                    });
+                });
             });
-        }
+        });
     }
 }
 
 
+QHostAddress IntegrationPluginGoECharger::getHostAddress(Thing *thing)
+{
+    if (m_monitors.contains(thing))
+        return m_monitors.value(thing)->networkDeviceInfo().address();
+
+    return QHostAddress();
+}
+
+IntegrationPluginGoECharger::ApiVersion IntegrationPluginGoECharger::getApiVersion(Thing *thing)
+{
+    return static_cast<ApiVersion>(thing->paramValue(goeHomeThingApiVersionParamTypeId).toUInt());
+}
+
+void IntegrationPluginGoECharger::refreshHttp()
+{
+    // Update all things which don't use mqtt
+    foreach (Thing *thing, myThings().filterByParam(goeHomeThingUseMqttParamTypeId, false)) {
+        refreshHttpThing(thing);
+    }
+}
+
+void IntegrationPluginGoECharger::refreshHttpThing(Thing *thing)
+{
+    // Do not refresh if we use mqtt
+    if (thing->paramValue(goeHomeThingUseMqttParamTypeId).toBool())
+        return;
+
+    // The monitor does not see the device, no need to spent the http request effort
+    if (m_monitors.contains(thing) && !m_monitors.value(thing)->reachable())
+        return;
+
+    // Make sure there is not a request pending for this thing, otherwise wait for the next refresh
+    if (m_pendingReplies.contains(thing) && m_pendingReplies.value(thing))
+        return;
+
+    QHostAddress address = getHostAddress(thing);
+    if (address.isNull())
+        return;
+
+    qCDebug(dcGoECharger()) << "Refresh HTTP status from" << thing->name();
+    QNetworkReply *reply = hardwareManager()->networkManager()->get(buildStatusRequest(thing));
+    m_pendingReplies.insert(thing, reply);
+
+    connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+    connect(reply, &QNetworkReply::finished, thing, [=](){
+        // We are done with this thing reply
+        m_pendingReplies.remove(thing);
+
+        if (reply->error() != QNetworkReply::NoError) {
+            qCWarning(dcGoECharger()) << "HTTP status reply returned error:" << reply->errorString() << reply->readAll();
+            thing->setStateValue(goeHomeConnectedStateTypeId, false);
+            return;
+        }
+
+        QByteArray data = reply->readAll();
+        QJsonParseError error;
+        QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &error);
+        if (error.error != QJsonParseError::NoError) {
+            qCWarning(dcGoECharger()) << "Failed to parse status data for thing " << thing->name() << qUtf8Printable(data) << error.errorString();
+            thing->setStateValue(goeHomeConnectedStateTypeId, false);
+            return;
+        }
+
+        // Valid json data received, connected true
+        thing->setStateValue(goeHomeConnectedStateTypeId, true);
+
+        //qCDebug(dcGoECharger()) << "Received" << qUtf8Printable(jsonDoc.toJson());
+        QVariantMap statusMap = jsonDoc.toVariant().toMap();
+        update(thing, statusMap);
+    });
+}
