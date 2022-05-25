@@ -1,3 +1,33 @@
+nymea-plugins (1.1.1) jammy; urgency=medium
+
+  [ Michael Zanetti ]
+  * WIP: New Plugin: nymea owlets
+
+  [ Simon Stürz ]
+  * TcpCommander: Add TCP server broadcast functionality to send data to
+    all connected clients
+  * NetworkDetector: Make use of the internal network device monitor
+
+  [ Michael Zanetti ]
+  * New Plugin: Bimmer connected
+  * Fix dpkg Priority field
+
+  [ Simon Stürz ]
+  * Kodi: Use nymea icon for notifications and make notifications
+    configurable
+  * System monitor: Disable unneeded caching of monitor states
+  * Keba : Add support for wallboxes without energy meter (German
+    Edition)
+  * goe: Update discovery and add API V2 support
+
+  [ Christian Fetzer ]
+  * somfytahoma: Use local connection "Somfy Developer Mode"
+
+  [ Simon Stürz ]
+  * Keba: Use network device monitor as IP source
+
+ -- jenkins <developer@nymea.io>  Wed, 25 May 2022 12:27:46 +0200
+
 nymea-plugins (1.1.0) jammy; urgency=medium
 
   [ Simon Stürz ]
